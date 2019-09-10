@@ -114,6 +114,7 @@
 #include "xgethostname.h"
 #include "c-ctype.h"
 #include "canonicalize.h"
+#include "statx.h"
 
 /* Include <sys/capability.h> last to avoid a clash of <sys/types.h>
    include guards with some premature versions of libcap.
@@ -1062,6 +1063,97 @@ dired_dump_obstack (const char *prefix, struct obstack *os)
       putchar ('\n');
     }
 }
+
+#if HAVE_STATX && defined STATX_INO
+static unsigned int
+calc_req_mask (void)
+{
+  unsigned int mask = STATX_MODE;
+
+  if (print_inode)
+    mask |= STATX_INO;
+  if (format == long_format) {
+    mask |= STATX_NLINK | STATX_SIZE;
+    if (print_owner || print_author)
+      mask |= STATX_UID;
+    if (print_group)
+      mask |= STATX_GID;
+  }
+  return mask;
+}
+
+static int
+do_statx (int fd, const char *name, struct stat *st, int flags,
+          unsigned int mask)
+{
+  struct statx stx;
+  int ret = statx (fd, name, flags, mask, &stx);
+  if (ret >= 0)
+    statx_to_stat (&stx, st);
+  return ret;
+}
+
+static inline int
+do_stat (const char *name, struct stat *st)
+{
+  return do_statx (AT_FDCWD, name, st, 0, calc_req_mask ());
+}
+
+static inline int
+do_lstat (const char *name, struct stat *st)
+{
+  return do_statx (AT_FDCWD, name, st, AT_SYMLINK_NOFOLLOW, calc_req_mask ());
+}
+
+static inline int
+stat_for_mode (const char *name, struct stat *st)
+{
+  return do_statx (AT_FDCWD, name, st, 0, STATX_MODE);
+}
+
+/* dev+ino should be static, so no need to sync with backing store */
+static inline int
+stat_for_ino (const char *name, struct stat *st)
+{
+  return do_statx (AT_FDCWD, name, st, AT_STATX_DONT_SYNC, STATX_INO);
+}
+
+static inline int
+fstat_for_ino (int fd, struct stat *st)
+{
+  return do_statx (fd, "", st, AT_EMPTY_PATH|AT_STATX_DONT_SYNC, STATX_INO);
+}
+#else
+static inline int
+do_stat (const char *name, struct stat *st)
+{
+  return stat (name, st);
+}
+
+static inline int
+do_lstat (const char *name, struct stat *st)
+{
+  return lstat (name, st);
+}
+
+static inline int
+stat_for_mode (const char *name, struct stat *st)
+{
+  return stat (name, st);
+}
+
+static inline int
+stat_for_ino (const char *name, struct stat *st)
+{
+  return stat (name, st);
+}
+
+static inline int
+fstat_for_ino (int fd, struct stat *st)
+{
+  return fstat (fd, st);
+}
+#endif
 
 /* Return the address of the first plain %b spec in FMT, or NULL if
    there is no such spec.  %5b etc. do not match, so that user
@@ -2737,10 +2829,10 @@ print_dir (char const *name, char const *realname, bool command_line_arg)
       struct stat dir_stat;
       int fd = dirfd (dirp);
 
-      /* If dirfd failed, endure the overhead of using stat.  */
+      /* If dirfd failed, endure the overhead of stat'ing by path  */
       if ((0 <= fd
-           ? fstat (fd, &dir_stat)
-           : stat (name, &dir_stat)) < 0)
+           ? fstat_for_ino (fd, &dir_stat)
+           : stat_for_ino (name, &dir_stat)) < 0)
         {
           file_failure (command_line_arg,
                         _("cannot determine device and inode of %s"), name);
@@ -3202,7 +3294,7 @@ gobble_file (char const *name, enum filetype type, ino_t inode,
       switch (dereference)
         {
         case DEREF_ALWAYS:
-          err = stat (full_name, &f->stat);
+          err = do_stat (full_name, &f->stat);
           do_deref = true;
           break;
 
@@ -3211,7 +3303,7 @@ gobble_file (char const *name, enum filetype type, ino_t inode,
           if (command_line_arg)
             {
               bool need_lstat;
-              err = stat (full_name, &f->stat);
+              err = do_stat (full_name, &f->stat);
               do_deref = true;
 
               if (dereference == DEREF_COMMAND_LINE_ARGUMENTS)
@@ -3231,7 +3323,7 @@ gobble_file (char const *name, enum filetype type, ino_t inode,
           FALLTHROUGH;
 
         default: /* DEREF_NEVER */
-          err = lstat (full_name, &f->stat);
+          err = do_lstat (full_name, &f->stat);
           do_deref = false;
           break;
         }
@@ -3320,7 +3412,7 @@ gobble_file (char const *name, enum filetype type, ino_t inode,
              they won't be traced and when no indicator is needed.  */
           if (linkname
               && (file_type <= indicator_style || check_symlink_mode)
-              && stat (linkname, &linkstats) == 0)
+              && stat_for_mode (linkname, &linkstats) == 0)
             {
               f->linkok = true;
               f->linkmode = linkstats.st_mode;
